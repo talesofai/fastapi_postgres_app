@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from sqlalchemy import text
 from uuid import UUID
 import uvicorn
@@ -44,18 +44,18 @@ def create_artifact(artifact: schemas.ArtifactCreate, db: Session = Depends(get_
             status_code=status.HTTP_409_CONFLICT,
             detail=f"具有相同MD5的图片已存在: {existing_artifact.id}"
         )
-    
+
     # 准备数据
     try:
         # 创建Artifact对象，确保不包含aspect_ratio字段
         artifact_dict = {k: v for k, v in artifact.model_dump().items() if k != 'aspect_ratio'}
         db_artifact = models.Artifact(**artifact_dict)
-        
+
         # 添加到数据库
         db.add(db_artifact)
         db.commit()
         db.refresh(db_artifact)
-        
+
         return db_artifact
     except Exception as e:
         db.rollback()
@@ -68,8 +68,8 @@ def create_artifact(artifact: schemas.ArtifactCreate, db: Session = Depends(get_
 # 获取所有图片（支持分页和过滤）
 @app.get("/artifacts/", response_model=List[schemas.Artifact])
 def read_artifacts(
-    skip: int = 0, 
-    limit: int = 100, 
+    skip: int = 0,
+    limit: int = 100,
     format: Optional[str] = None,
     min_width: Optional[int] = None,
     max_width: Optional[int] = None,
@@ -79,7 +79,7 @@ def read_artifacts(
     db: Session = Depends(get_db)
 ):
     query = db.query(models.Artifact)
-    
+
     # 应用过滤条件
     if not include_deleted:
         query = query.filter(models.Artifact.is_deleted == False)
@@ -93,11 +93,11 @@ def read_artifacts(
         query = query.filter(models.Artifact.height >= min_height)
     if max_height:
         query = query.filter(models.Artifact.height <= max_height)
-    
+
     # 应用排序和分页
     query = query.order_by(models.Artifact.upload_time.desc())
     artifacts = query.offset(skip).limit(limit).all()
-    
+
     return artifacts
 
 # 获取单个图片
@@ -114,20 +114,20 @@ def update_artifact(artifact_id: UUID, artifact: schemas.ArtifactUpdate, db: Ses
     db_artifact = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
     if db_artifact is None:
         raise HTTPException(status_code=404, detail="图片不存在")
-    
+
     # 更新时间戳
     update_data = artifact.model_dump(exclude_unset=True)
-    
+
     # 移除aspect_ratio字段（这是数据库生成列）
     if "aspect_ratio" in update_data:
         del update_data["aspect_ratio"]
-    
+
     try:
         # 更新图片属性，确保不更新aspect_ratio
         for key, value in update_data.items():
             if key != "aspect_ratio":  # 额外检查，确保不设置aspect_ratio
                 setattr(db_artifact, key, value)
-        
+
         db.commit()
         db.refresh(db_artifact)
         return db_artifact
@@ -145,7 +145,7 @@ def delete_artifact(artifact_id: UUID, permanent: bool = False, db: Session = De
     db_artifact = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
     if db_artifact is None:
         raise HTTPException(status_code=404, detail="图片不存在")
-    
+
     if permanent:
         # 永久删除
         db.delete(db_artifact)
@@ -153,7 +153,7 @@ def delete_artifact(artifact_id: UUID, permanent: bool = False, db: Session = De
         # 软删除
         db_artifact.is_deleted = True
         db_artifact.deleted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
-    
+
     db.commit()
     return None
 
@@ -165,428 +165,394 @@ def get_artifact_by_md5(md5: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="未找到具有此MD5的图片")
     return db_artifact
 
-# ============== 集合相关API ==============
-
-# 创建新集合
-@app.post("/collections/", response_model=schemas.Collection, status_code=status.HTTP_201_CREATED)
-def create_collection(collection: schemas.CollectionCreate, db: Session = Depends(get_db)):
-    try:
-        # 添加创建和更新时间戳
-        current_time = int(time.time())
-        collection_dict = collection.model_dump()
-        collection_dict["create_time"] = current_time
-        collection_dict["update_time"] = current_time
-        
-        # 创建集合对象
-        db_collection = models.Collection(**collection_dict)
-        
-        # 添加到数据库
-        db.add(db_collection)
-        db.commit()
-        db.refresh(db_collection)
-        
-        return db_collection
-    except Exception as e:
-        db.rollback()
-        print(f"创建集合时发生错误: {str(e)}")
+# Caption Preset API
+@app.post("/presets/", response_model=schemas.CaptionPreset, status_code=status.HTTP_201_CREATED)
+def create_preset(preset: schemas.CaptionPresetCreate, db: Session = Depends(get_db)):
+    # 检查预设是否已存在
+    existing_preset = db.query(models.CaptionPreset).filter(models.CaptionPreset.preset_key == preset.preset_key).first()
+    if existing_preset and not existing_preset.is_deleted:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建集合失败: {str(e)}"
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"具有相同键的预设已存在: {preset.preset_key}"
         )
 
-# 获取所有集合（支持分页和过滤）
-@app.get("/collections/", response_model=List[schemas.Collection])
-def read_collections(
-    skip: int = 0, 
-    limit: int = 100,
-    include_deleted: bool = False,
-    creator_id: Optional[UUID] = None,
-    db: Session = Depends(get_db)
-):
-    query = db.query(models.Collection)
-    
+    # 如果存在但已删除，则恢复并更新
+    if existing_preset and existing_preset.is_deleted:
+        for key, value in preset.model_dump().items():
+            setattr(existing_preset, key, value)
+        existing_preset.is_deleted = False
+        existing_preset.deleted_time = None
+        db.commit()
+        db.refresh(existing_preset)
+        return existing_preset
+
+    # 创建新预设
+    try:
+        db_preset = models.CaptionPreset(**preset.model_dump())
+        db.add(db_preset)
+        db.commit()
+        db.refresh(db_preset)
+        return db_preset
+    except Exception as e:
+        db.rollback()
+        print(f"创建预设时发生错误: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建预设失败: {str(e)}"
+        )
+
+@app.get("/presets/", response_model=List[schemas.CaptionPreset])
+def read_presets(skip: int = 0, limit: int = 100, include_deleted: bool = False, db: Session = Depends(get_db)):
+    query = db.query(models.CaptionPreset)
+
     # 应用过滤条件
     if not include_deleted:
-        query = query.filter(models.Collection.is_deleted == False)
-    if creator_id:
-        query = query.filter(models.Collection.creator_id == creator_id)
-    
+        query = query.filter(models.CaptionPreset.is_deleted == False)
+
     # 应用排序和分页
-    query = query.order_by(models.Collection.create_time.desc())
-    collections = query.offset(skip).limit(limit).all()
-    
-    return collections
+    query = query.order_by(models.CaptionPreset.create_time.desc())
+    presets = query.offset(skip).limit(limit).all()
 
-# 获取单个集合
-@app.get("/collections/{collection_id}", response_model=schemas.Collection)
-def read_collection(collection_id: UUID, db: Session = Depends(get_db)):
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    return db_collection
+    return presets
 
-# 获取带有图片的集合详情
-@app.get("/collections/{collection_id}/with-artifacts", response_model=schemas.CollectionWithArtifacts)
-def read_collection_with_artifacts(
-    collection_id: UUID, 
-    artifact_limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    # 获取集合信息
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    
-    # 获取集合中的图片
-    artifacts = db.query(models.Artifact).\
-        join(models.ArtifactCollectionMap, models.Artifact.id == models.ArtifactCollectionMap.artifact_id).\
-        filter(models.ArtifactCollectionMap.collection_id == collection_id).\
-        filter(models.Artifact.is_deleted == False).\
-        order_by(models.ArtifactCollectionMap.add_time.desc()).\
-        limit(artifact_limit).all()
-    
-    # 构建响应
-    collection_data = schemas.Collection.model_validate(db_collection)
-    result = schemas.CollectionWithArtifacts(**collection_data.model_dump())
-    result.artifacts = artifacts
-    
-    return result
+@app.get("/presets/{preset_key}", response_model=schemas.CaptionPreset)
+def read_preset(preset_key: str, db: Session = Depends(get_db)):
+    db_preset = db.query(models.CaptionPreset).filter(
+        models.CaptionPreset.preset_key == preset_key,
+        models.CaptionPreset.is_deleted == False
+    ).first()
 
-# 获取集合中的所有图片
-@app.get("/collections/{collection_id}/artifacts", response_model=List[schemas.Artifact])
-def read_collection_artifacts(
-    collection_id: UUID, 
-    skip: int = 0, 
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    # 验证集合存在
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    
-    # 获取集合中的图片
-    artifacts = db.query(models.Artifact).\
-        join(models.ArtifactCollectionMap, models.Artifact.id == models.ArtifactCollectionMap.artifact_id).\
-        filter(models.ArtifactCollectionMap.collection_id == collection_id).\
-        filter(models.Artifact.is_deleted == False).\
-        order_by(models.ArtifactCollectionMap.add_time.desc()).\
-        offset(skip).limit(limit).all()
-    
-    return artifacts
+    if db_preset is None:
+        raise HTTPException(status_code=404, detail="预设不存在")
 
-# 更新集合
-@app.put("/collections/{collection_id}", response_model=schemas.Collection)
-def update_collection(collection_id: UUID, collection: schemas.CollectionUpdate, db: Session = Depends(get_db)):
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    
-    # 更新时间戳
-    update_data = collection.model_dump(exclude_unset=True)
-    update_data["update_time"] = int(time.time())
-    
+    return db_preset
+
+@app.put("/presets/{preset_key}", response_model=schemas.CaptionPreset)
+def update_preset(preset_key: str, preset: schemas.CaptionPresetUpdate, db: Session = Depends(get_db)):
+    db_preset = db.query(models.CaptionPreset).filter(models.CaptionPreset.preset_key == preset_key).first()
+    if db_preset is None:
+        raise HTTPException(status_code=404, detail="预设不存在")
+
     try:
-        # 更新集合属性
+        # 更新预设属性
+        update_data = preset.model_dump(exclude_unset=True)
         for key, value in update_data.items():
-            setattr(db_collection, key, value)
-        
+            setattr(db_preset, key, value)
+
         db.commit()
-        db.refresh(db_collection)
-        return db_collection
+        db.refresh(db_preset)
+        return db_preset
     except Exception as e:
         db.rollback()
-        print(f"更新集合时发生错误: {str(e)}")
+        print(f"更新预设时发生错误: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"更新集合失败: {str(e)}"
+            detail=f"更新预设失败: {str(e)}"
         )
 
-# 软删除集合
-@app.delete("/collections/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_collection(collection_id: UUID, permanent: bool = False, db: Session = Depends(get_db)):
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    
+@app.delete("/presets/{preset_key}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_preset(preset_key: str, permanent: bool = False, db: Session = Depends(get_db)):
+    db_preset = db.query(models.CaptionPreset).filter(models.CaptionPreset.preset_key == preset_key).first()
+    if db_preset is None:
+        raise HTTPException(status_code=404, detail="预设不存在")
+
     try:
         if permanent:
             # 永久删除
-            db.delete(db_collection)
+            db.delete(db_preset)
         else:
             # 软删除
-            db_collection.is_deleted = True
-            db_collection.deleted_time = int(time.time())
-        
+            db_preset.is_deleted = True
+            db_preset.deleted_time = int(time.time() * 1000)  # 使用毫秒时间戳
+
         db.commit()
         return None
     except Exception as e:
         db.rollback()
-        print(f"删除集合时发生错误: {str(e)}")
+        print(f"删除预设时发生错误: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"删除集合失败: {str(e)}"
+            detail=f"删除预设失败: {str(e)}"
         )
 
-# ============== 图片集合映射相关API ==============
+# Caption API
+@app.post("/captions/", response_model=schemas.Caption, status_code=status.HTTP_201_CREATED)
+def create_caption(caption: schemas.CaptionCreate, db: Session = Depends(get_db)):
 
-# 添加图片到集合
-@app.post("/collections/{collection_id}/artifacts/{artifact_id}", status_code=status.HTTP_201_CREATED)
-def add_artifact_to_collection(collection_id: UUID, artifact_id: UUID, db: Session = Depends(get_db)):
-    # 检查集合是否存在
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    
-    # 检查图片是否存在
-    db_artifact = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
-    if db_artifact is None:
-        raise HTTPException(status_code=404, detail="图片不存在")
-    
-    # 检查映射是否已存在
-    existing_map = db.query(models.ArtifactCollectionMap).filter(
-        models.ArtifactCollectionMap.artifact_id == artifact_id,
-        models.ArtifactCollectionMap.collection_id == collection_id
+    # 如果指定了preset_key，检查预设是否存在
+    if caption.preset_key:
+        db_preset = db.query(models.CaptionPreset).filter(
+            models.CaptionPreset.preset_key == caption.preset_key,
+            models.CaptionPreset.is_deleted == False
+        ).first()
+        if db_preset is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"预设不存在: {caption.preset_key}"
+            )
+
+    # 检查是否已存在相同预设的描述
+    if caption.preset_key:
+        existing_caption = db.query(models.Caption).filter(
+            models.Caption.preset_key == caption.preset_key,
+            models.Caption.is_deleted == False
+        ).first()
+
+        # 如果存在，则更新
+        if existing_caption:
+            update_data = caption.model_dump(exclude={"id"} if hasattr(caption, "id") else set())
+            for key, value in update_data.items():
+                setattr(existing_caption, key, value)
+
+            db.commit()
+            db.refresh(existing_caption)
+            return existing_caption
+
+    # 创建新描述
+    try:
+        caption_dict = caption.model_dump()
+        db_caption = models.Caption(**caption_dict)
+        db.add(db_caption)
+        db.commit()
+        db.refresh(db_caption)
+        return db_caption
+    except Exception as e:
+        db.rollback()
+        print(f"创建描述时发生错误: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建描述失败: {str(e)}"
+        )
+
+@app.get("/captions/", response_model=List[schemas.Caption])
+def read_captions(skip: int = 0, limit: int = 100, include_deleted: bool = False, db: Session = Depends(get_db)):
+    query = db.query(models.Caption)
+
+    # 应用过滤条件
+    if not include_deleted:
+        query = query.filter(models.Caption.is_deleted == False)
+
+    # 应用排序和分页
+    query = query.order_by(models.Caption.upload_time.desc())
+    captions = query.offset(skip).limit(limit).all()
+
+    return captions
+
+@app.get("/captions/{caption_id}", response_model=schemas.Caption)
+def read_caption(caption_id: UUID, db: Session = Depends(get_db)):
+    db_caption = db.query(models.Caption).filter(
+        models.Caption.id == caption_id,
+        models.Caption.is_deleted == False
     ).first()
-    
+
+    if db_caption is None:
+        raise HTTPException(status_code=404, detail="描述不存在")
+
+    return db_caption
+
+@app.get("/captions/preset/{preset_key}", response_model=schemas.Caption)
+def read_caption_by_preset(preset_key: str, db: Session = Depends(get_db)):
+    db_caption = db.query(models.Caption).filter(
+        models.Caption.preset_key == preset_key,
+        models.Caption.is_deleted == False
+    ).first()
+
+    if db_caption is None:
+        raise HTTPException(status_code=404, detail="描述不存在")
+
+    return db_caption
+
+@app.put("/captions/{caption_id}", response_model=schemas.Caption)
+def update_caption(caption_id: UUID, caption: schemas.CaptionUpdate, db: Session = Depends(get_db)):
+    db_caption = db.query(models.Caption).filter(models.Caption.id == caption_id).first()
+    if db_caption is None:
+        raise HTTPException(status_code=404, detail="描述不存在")
+
+    try:
+        # 更新描述属性
+        update_data = caption.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(db_caption, key, value)
+
+        db.commit()
+        db.refresh(db_caption)
+        return db_caption
+    except Exception as e:
+        db.rollback()
+        print(f"更新描述时发生错误: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"更新描述失败: {str(e)}"
+        )
+
+@app.delete("/captions/{caption_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_caption(caption_id: UUID, permanent: bool = False, db: Session = Depends(get_db)):
+    db_caption = db.query(models.Caption).filter(models.Caption.id == caption_id).first()
+    if db_caption is None:
+        raise HTTPException(status_code=404, detail="描述不存在")
+
+    try:
+        if permanent:
+            # 永久删除
+            db.delete(db_caption)
+        else:
+            # 软删除
+            db_caption.is_deleted = True
+            db_caption.deleted_time = int(time.time() * 1000)  # 使用毫秒时间戳
+
+        db.commit()
+        return None
+    except Exception as e:
+        db.rollback()
+        print(f"删除描述时发生错误: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"删除描述失败: {str(e)}"
+        )
+
+# ArtifactCaptionMap API
+@app.post("/artifact-caption-maps/", response_model=schemas.ArtifactCaptionMap, status_code=status.HTTP_201_CREATED)
+def create_artifact_caption_map(map_data: schemas.ArtifactCaptionMapCreate, db: Session = Depends(get_db)):
+    # 检查图片是否存在
+    db_artifact = db.query(models.Artifact).filter(models.Artifact.id == map_data.artifact_id).first()
+    if db_artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"图片不存在: {map_data.artifact_id}"
+        )
+
+    # 检查描述是否存在
+    db_caption = db.query(models.Caption).filter(models.Caption.id == map_data.caption_id).first()
+    if db_caption is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"描述不存在: {map_data.caption_id}"
+        )
+
+    # 检查映射是否已存在
+    existing_map = db.query(models.ArtifactCaptionMap).filter(
+        models.ArtifactCaptionMap.artifact_id == map_data.artifact_id,
+        models.ArtifactCaptionMap.caption_id == map_data.caption_id
+    ).first()
+
     if existing_map:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="图片已经在集合中"
-        )
-    
-    try:
-        # 创建新映射
-        current_time = int(time.time())
-        new_map = models.ArtifactCollectionMap(
-            artifact_id=artifact_id,
-            collection_id=collection_id,
-            add_time=current_time
-        )
-        
-        # 如果集合没有封面，将此图片设为封面
-        if not db_collection.cover_artifact_id:
-            db_collection.cover_artifact_id = artifact_id
-            db_collection.update_time = current_time
-        
-        db.add(new_map)
-        db.commit()
-        
-        return {"status": "success", "message": "图片已添加到集合"}
-    except Exception as e:
-        db.rollback()
-        print(f"添加图片到集合时发生错误: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"添加图片到集合失败: {str(e)}"
+            detail=f"图片 {map_data.artifact_id} 与描述 {map_data.caption_id} 的映射已存在"
         )
 
-# 从集合中移除图片
-@app.delete("/collections/{collection_id}/artifacts/{artifact_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_artifact_from_collection(collection_id: UUID, artifact_id: UUID, db: Session = Depends(get_db)):
-    # 查找映射
-    map_entry = db.query(models.ArtifactCollectionMap).filter(
-        models.ArtifactCollectionMap.artifact_id == artifact_id,
-        models.ArtifactCollectionMap.collection_id == collection_id
-    ).first()
-    
-    if map_entry is None:
-        raise HTTPException(status_code=404, detail="图片不在集合中")
-    
+    # 创建新映射
     try:
-        # 获取集合
-        db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-        
-        # 如果移除的是封面图片，需要更新封面
-        if db_collection and db_collection.cover_artifact_id == artifact_id:
-            # 尝试找另一张图片作为封面
-            another_artifact = db.query(models.ArtifactCollectionMap).\
-                filter(models.ArtifactCollectionMap.collection_id == collection_id).\
-                filter(models.ArtifactCollectionMap.artifact_id != artifact_id).\
-                order_by(models.ArtifactCollectionMap.add_time.desc()).\
-                first()
-            
-            if another_artifact:
-                db_collection.cover_artifact_id = another_artifact.artifact_id
-            else:
-                db_collection.cover_artifact_id = None
-            
-            db_collection.update_time = int(time.time())
-        
-        # 移除映射
-        db.delete(map_entry)
+        db_map = models.ArtifactCaptionMap(**map_data.model_dump())
+        db.add(db_map)
+        db.commit()
+        db.refresh(db_map)
+        return db_map
+    except Exception as e:
+        db.rollback()
+        print(f"创建映射时发生错误: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建映射失败: {str(e)}"
+        )
+
+@app.get("/artifact-caption-maps/", response_model=List[schemas.ArtifactCaptionMap])
+def read_artifact_caption_maps(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    maps = db.query(models.ArtifactCaptionMap).offset(skip).limit(limit).all()
+    return maps
+
+@app.get("/artifact-caption-maps/artifact/{artifact_id}", response_model=List[schemas.ArtifactCaptionMap])
+def read_maps_by_artifact(artifact_id: UUID, db: Session = Depends(get_db)):
+    maps = db.query(models.ArtifactCaptionMap).filter(
+        models.ArtifactCaptionMap.artifact_id == artifact_id
+    ).all()
+    return maps
+
+@app.get("/artifact-caption-maps/caption/{caption_id}", response_model=List[schemas.ArtifactCaptionMap])
+def read_maps_by_caption(caption_id: UUID, db: Session = Depends(get_db)):
+    maps = db.query(models.ArtifactCaptionMap).filter(
+        models.ArtifactCaptionMap.caption_id == caption_id
+    ).all()
+    return maps
+
+@app.delete("/artifact-caption-maps/{artifact_id}/{caption_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_artifact_caption_map(artifact_id: UUID, caption_id: UUID, db: Session = Depends(get_db)):
+    db_map = db.query(models.ArtifactCaptionMap).filter(
+        models.ArtifactCaptionMap.artifact_id == artifact_id,
+        models.ArtifactCaptionMap.caption_id == caption_id
+    ).first()
+
+    if db_map is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"图片 {artifact_id} 与描述 {caption_id} 的映射不存在"
+        )
+
+    try:
+        db.delete(db_map)
         db.commit()
         return None
     except Exception as e:
         db.rollback()
-        print(f"从集合中移除图片时发生错误: {str(e)}")
+        print(f"删除映射时发生错误: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"从集合中移除图片失败: {str(e)}"
+            detail=f"删除映射失败: {str(e)}"
         )
 
-# 获取包含特定图片的所有集合
-@app.get("/artifacts/{artifact_id}/collections", response_model=List[schemas.Collection])
-def get_collections_for_artifact(
-    artifact_id: UUID, 
-    skip: int = 0, 
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    # 验证图片存在
-    db_artifact = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
-    if db_artifact is None:
-        raise HTTPException(status_code=404, detail="图片不存在")
-    
-    # 获取包含此图片的集合
-    collections = db.query(models.Collection).\
-        join(models.ArtifactCollectionMap, models.Collection.id == models.ArtifactCollectionMap.collection_id).\
-        filter(models.ArtifactCollectionMap.artifact_id == artifact_id).\
-        filter(models.Collection.is_deleted == False).\
-        order_by(models.Collection.name).\
-        offset(skip).limit(limit).all()
-    
-    return collections
+# 批量创建映射
+@app.post("/artifact-caption-maps/batch/", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
+def create_artifact_caption_maps_batch(maps_data: List[schemas.ArtifactCaptionMapCreate], db: Session = Depends(get_db)):
+    created_count = 0
+    skipped_count = 0
+    errors = []
 
-# 批量添加图片到集合
-@app.post("/collections/{collection_id}/artifacts/batch", status_code=status.HTTP_201_CREATED)
-def add_artifacts_to_collection_batch(
-    collection_id: UUID,
-    artifact_ids: List[UUID],
-    db: Session = Depends(get_db)
-):
-    # 检查集合是否存在
-    db_collection = db.query(models.Collection).filter(models.Collection.id == collection_id).first()
-    if db_collection is None:
-        raise HTTPException(status_code=404, detail="集合不存在")
-    
-    if not artifact_ids:
-        raise HTTPException(status_code=400, detail="图片ID列表不能为空")
-    
-    try:
-        current_time = int(time.time())
-        added_count = 0
-        already_exists_count = 0
-        not_found_count = 0
-        
-        for artifact_id in artifact_ids:
+    for map_data in maps_data:
+        try:
             # 检查图片是否存在
-            db_artifact = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
-            if not db_artifact:
-                not_found_count += 1
+            db_artifact = db.query(models.Artifact).filter(models.Artifact.id == map_data.artifact_id).first()
+            if db_artifact is None:
+                errors.append(f"图片不存在: {map_data.artifact_id}")
                 continue
-            
+
+            # 检查描述是否存在
+            db_caption = db.query(models.Caption).filter(models.Caption.id == map_data.caption_id).first()
+            if db_caption is None:
+                errors.append(f"描述不存在: {map_data.caption_id}")
+                continue
+
             # 检查映射是否已存在
-            existing_map = db.query(models.ArtifactCollectionMap).filter(
-                models.ArtifactCollectionMap.artifact_id == artifact_id,
-                models.ArtifactCollectionMap.collection_id == collection_id
+            existing_map = db.query(models.ArtifactCaptionMap).filter(
+                models.ArtifactCaptionMap.artifact_id == map_data.artifact_id,
+                models.ArtifactCaptionMap.caption_id == map_data.caption_id
             ).first()
-            
+
             if existing_map:
-                already_exists_count += 1
+                skipped_count += 1
                 continue
-            
-            # 添加新映射
-            new_map = models.ArtifactCollectionMap(
-                artifact_id=artifact_id,
-                collection_id=collection_id,
-                add_time=current_time
-            )
-            db.add(new_map)
-            added_count += 1
-            
-            # 如果集合没有封面，将第一张有效图片设为封面
-            if not db_collection.cover_artifact_id and added_count == 1:
-                db_collection.cover_artifact_id = artifact_id
-                db_collection.update_time = current_time
-        
+
+            # 创建新映射
+            db_map = models.ArtifactCaptionMap(**map_data.model_dump())
+            db.add(db_map)
+            created_count += 1
+
+        except Exception as e:
+            errors.append(f"处理映射 {map_data.artifact_id}-{map_data.caption_id} 时出错: {str(e)}")
+
+    try:
         db.commit()
-        
         return {
-            "status": "success", 
-            "message": f"已添加{added_count}张图片到集合，{already_exists_count}张已存在，{not_found_count}张未找到"
+            "success": True,
+            "created_count": created_count,
+            "skipped_count": skipped_count,
+            "errors": errors
         }
     except Exception as e:
         db.rollback()
-        print(f"批量添加图片到集合时发生错误: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"批量添加图片到集合失败: {str(e)}"
+            detail=f"批量创建映射失败: {str(e)}"
         )
-
-# ============== 用户相关API ==============
-
-# 根据ID获取用户信息
-@app.get("/users/{user_id}", response_model=schemas.User)
-def get_user_by_id(user_id: UUID, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    return user
-
-# 根据用户名获取用户信息
-@app.get("/users/username/{username}", response_model=schemas.User)
-def get_user_by_username(username: str, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.username == username).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    return user
-
-# 根据邮箱获取用户信息
-@app.get("/users/email/{email}", response_model=schemas.User)
-def get_user_by_email(email: str, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == email).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    return user
-
-# 获取所有用户（分页）
-@app.get("/users/", response_model=List[schemas.User])
-def get_users(
-    skip: int = 0, 
-    limit: int = 100,
-    is_active: Optional[bool] = None,
-    is_superuser: Optional[bool] = None,
-    db: Session = Depends(get_db)
-):
-    query = db.query(models.User)
-    
-    # 应用过滤条件
-    if is_active is not None:
-        query = query.filter(models.User.is_active == is_active)
-    if is_superuser is not None:
-        query = query.filter(models.User.is_superuser == is_superuser)
-    
-    # 应用排序和分页
-    users = query.order_by(models.User.username).offset(skip).limit(limit).all()
-    return users
-
-# 验证用户凭据（用于登录）
-@app.post("/users/login/", response_model=schemas.User)
-def login_user(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
-    """
-    用户登录API
-    接收用户名和密码，返回用户信息
-    """
-    # 在实际应用中，密码应该是哈希的，这里假设password字段包含哈希密码
-    # 应该使用像passlib这样的库进行密码验证
-    user = db.query(models.User).filter(
-        models.User.username == user_credentials.username
-    ).first()
-    
-    if not user or user.hashed_password != user_credentials.password:  # 不安全！仅用于演示
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户名或密码错误"
-        )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户未激活"
-        )
-    
-    return user
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

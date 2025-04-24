@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, List, Union
+from pydantic import BaseModel, Field
+from typing import Optional, List, Union, Dict, Any
 from datetime import datetime
 import uuid
 from uuid import UUID
@@ -27,7 +27,7 @@ class ArtifactCreate(ArtifactBase):
     size_2048x_path: Optional[str] = None
     size_1024x_path: Optional[str] = None
     size_256x_path: Optional[str] = None
-    
+
     # 注意：不包含aspect_ratio，因为它是生成列
 
 class ArtifactUpdate(BaseModel):
@@ -49,7 +49,7 @@ class ArtifactUpdate(BaseModel):
     size_256x_path: Optional[str] = None
     is_deleted: Optional[bool] = None
     deleted_time: Optional[str] = None
-    
+
     # 注意：不包含aspect_ratio，因为它是生成列
 
 class Artifact(ArtifactBase):
@@ -65,78 +65,83 @@ class Artifact(ArtifactBase):
     size_256x_path: Optional[str] = None
     is_deleted: bool
     deleted_time: Optional[str] = None
-    
+
     class Config:
         from_attributes = True
 
-# Collection相关Schema
-class CollectionBase(BaseModel):
-    """集合基础Schema"""
-    name: str
+# Caption Preset Schemas
+class CaptionPresetBase(BaseModel):
+    """预设基础Schema"""
+    config: Dict[str, Any]  # 存储模型、提示词等配置信息
     description: Optional[str] = None
-    creator_id: Optional[UUID] = None
-    cover_artifact_id: Optional[UUID] = None
-
-class CollectionCreate(CollectionBase):
-    """创建集合Schema"""
-    pass
-
-class CollectionUpdate(BaseModel):
-    """更新集合Schema"""
-    name: Optional[str] = None
-    description: Optional[str] = None
-    creator_id: Optional[UUID] = None
-    cover_artifact_id: Optional[UUID] = None
-    is_deleted: Optional[bool] = None
-
-class Collection(CollectionBase):
-    """集合完整Schema"""
-    id: UUID
     create_time: int
-    update_time: int
+
+class CaptionPresetCreate(CaptionPresetBase):
+    """创建预设Schema"""
+    preset_key: str
+    creator_id: Optional[UUID] = None
+
+class CaptionPresetUpdate(BaseModel):
+    """更新预设Schema"""
+    config: Optional[Dict[str, Any]] = None
+    description: Optional[str] = None
+    is_deleted: Optional[bool] = None
+    deleted_time: Optional[int] = None
+
+class CaptionPreset(CaptionPresetBase):
+    """预设完整Schema"""
+    preset_key: str
+    creator_id: Optional[UUID] = None
     is_deleted: bool
     deleted_time: Optional[int] = None
-    
+
     class Config:
         from_attributes = True
 
-# ArtifactCollectionMap相关Schema
-class ArtifactCollectionMapBase(BaseModel):
-    """图片集合映射基础Schema"""
+# Caption Schemas
+class CaptionBase(BaseModel):
+    """描述基础Schema"""
+    type: Optional[str] = None
+    preset_key: Optional[str] = None
+    upload_time: int
+    text: Optional[str] = None
+
+class CaptionCreate(CaptionBase):
+    """创建描述Schema"""
+    extra_data: Optional[Dict[str, Any]] = None
+
+class CaptionUpdate(BaseModel):
+    """更新描述Schema"""
+    type: Optional[str] = None
+    preset_key: Optional[str] = None
+    upload_time: Optional[int] = None
+    text: Optional[str] = None
+    extra_data: Optional[Dict[str, Any]] = None
+    is_deleted: Optional[bool] = None
+    deleted_time: Optional[int] = None
+
+class Caption(CaptionBase):
+    """描述完整Schema"""
+    id: UUID
+    extra_data: Optional[Dict[str, Any]] = None
+    is_deleted: bool
+    deleted_time: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+# ArtifactCaptionMap Schemas
+class ArtifactCaptionMapBase(BaseModel):
+    """映射基础Schema"""
     artifact_id: UUID
-    collection_id: UUID
+    caption_id: UUID
     add_time: int
 
-class ArtifactCollectionMapCreate(BaseModel):
-    """创建图片集合映射Schema"""
-    artifact_id: UUID
-    collection_id: UUID
+class ArtifactCaptionMapCreate(ArtifactCaptionMapBase):
+    """创建映射Schema"""
+    pass
 
-class ArtifactCollectionMap(ArtifactCollectionMapBase):
-    """图片集合映射完整Schema"""
+class ArtifactCaptionMap(ArtifactCaptionMapBase):
+    """映射完整Schema"""
     class Config:
         from_attributes = True
-
-# 嵌套Schema
-class CollectionWithArtifacts(Collection):
-    """带有图片列表的集合Schema"""
-    artifacts: List[Artifact] = []
-
-# 简化后的User相关Schema
-class UserLogin(BaseModel):
-    """用户登录Schema"""
-    username: str
-    password: str
-
-class User(BaseModel):
-    """用户信息Schema"""
-    id: UUID
-    username: str
-    email: EmailStr
-    is_active: bool
-    is_superuser: bool
-    create_time: datetime
-    update_time: datetime
-    
-    class Config:
-        from_attributes = True 
